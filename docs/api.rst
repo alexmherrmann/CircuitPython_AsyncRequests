@@ -6,3 +6,6 @@
 
 .. automodule:: adafruit_requests
    :members:
+
+.. automodule:: adafruit_requests.async_session
+   :members:
