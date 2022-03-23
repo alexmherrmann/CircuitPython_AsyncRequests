@@ -1,4 +1,30 @@
-from adafruit_requests import Session
+# SPDX-FileCopyrightText: 2020 Dan Halbert for Adafruit Industries
+#
+# SPDX-License-Identifier: MIT
+
+"""
+`adafruit_requests.async_session`
+================================================================================
+
+"""
+
+import errno
+
+import json as json_module
+
+import asyncio
+from adafruit_requests import Session, Response, InvalidSchema, RetryError
+
+try:
+    from typing import Any, Dict, List, Optional
+    from circuitpython_typing.socket import (
+        SocketType,
+        SocketpoolModuleType,
+        SSLContextType,
+    )
+except ImportError:
+    pass
+
 
 class AsyncSession(Session):
     """HTTP session that shares sockets and ssl context."""
@@ -18,17 +44,18 @@ class AsyncSession(Session):
             try:
                 sent = socket.send(data[total_sent:])
             except OSError as exc:
-                if exc.errno == EAGAIN:
+                if exc.errno == errno.EAGAIN:
                     # Can't send right now (e.g., no buffer space), try again.
                     await asyncio.sleep(0)
                 # Some worse error.
-                raise _SendFailed()
-            except RuntimeError:
-                sent = 0
+                raise
+            except RuntimeError as exc:
+                raise OSError(errno.EIO) from exc
             if sent is None:
                 sent = len(data)
             if sent == 0:
-                raise _SendFailed()
+                # Not EAGAIN; that was already handled.
+                raise OSError(errno.EIO)
             total_sent += sent
 
 
@@ -61,11 +88,6 @@ class AsyncSession(Session):
             await self._asend(socket, b"\r\n")
         if json is not None:
             assert data is None
-            # pylint: disable=import-outside-toplevel
-            try:
-                import json as json_module
-            except ImportError:
-                import ujson as json_module
             data = json_module.dumps(json)
             await self._asend(socket, b"Content-Type: application/json\r\n")
         if data:
@@ -117,7 +139,7 @@ class AsyncSession(Session):
         elif proto == "https:":
             port = 443
         else:
-            raise ValueError("Unsupported protocol: " + proto)
+            raise InvalidSchema("Unsupported protocol: " + proto)
 
         if ":" in host:
             host, port = host.split(":", 1)
@@ -136,7 +158,7 @@ class AsyncSession(Session):
             ok = True
             try:
                 await self._asend_request(socket, host, method, path, headers, data, json)
-            except (_SendFailed, OSError):
+            except OSError:
                 ok = False
             if ok:
                 # Read the H of "HTTP/1.1" to make sure the socket is alive. send can appear to work
@@ -156,7 +178,7 @@ class AsyncSession(Session):
             socket = None
 
         if not socket:
-            raise OutOfRetries("Repeated socket failures")
+            raise RetryError("Repeated socket failures")
 
         resp = Response(socket, self)  # our response
         if "location" in resp.headers and 300 <= resp.status_code <= 399:
@@ -207,4 +229,4 @@ class AsyncSession(Session):
 
     async def adelete(self, url: str, **kw) -> Response:
         """Send HTTP DELETE request"""
-        return await self.axrequest("DELETE", url, **kw)
+        return await self.arequest("DELETE", url, **kw)

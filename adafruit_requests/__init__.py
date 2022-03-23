@@ -36,9 +36,22 @@ license='MIT'
 __version__ = "0.0.0-auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_Requests.git"
 
+import errno
+import sys
+
+import json as json_module
+
+if sys.implementation.name == "circuitpython":
+
+    def cast(_t, value):
+        """No-op shim for the typing.cast() function which is not available in CircuitPython."""
+        return value
+
+
 try:
+    from types import TracebackType
+    from typing import Any, Dict, List, Optional, Tuple, Type, cast
     from circuitpython_typing.socket import (
-        SupportsRecvInto,
         CircuitPythonSocketType,
         SocketType,
         SocketpoolModuleType,
@@ -47,15 +60,6 @@ try:
     )
 except ImportError:
     pass
-
-import errno
-import sys
-
-if sys.implementation.name == "circuitpython":
-
-    def cast(_t, value):
-        """No-op shim for the typing.cast() function which is not available in CircuitPython."""
-        return value
 
 
 class _RawResponse:
@@ -77,12 +81,20 @@ class _RawResponse:
         return self._response._readinto(buf)  # pylint: disable=protected-access
 
 
-class _SendFailed(Exception):
-    """Custom exception to abort sending a request."""
+class RequestException(OSError):
+    """Parent class for all requests exceptions"""
 
 
-class OutOfRetries(Exception):
+class RetryError(RequestException):
     """Raised when requests has retried to make a request unsuccessfully."""
+
+
+class ContentDecodingError(RequestException):
+    """Failed to decode response content."""
+
+
+class InvalidSchema(RequestException):
+    """The URL scheme provided is either invalid or unsupported."""
 
 
 class Response:
@@ -108,12 +120,13 @@ class Response:
         self._backwards_compatible = not hasattr(sock, "recv_into")
 
         http = self._readto(b" ")
+        print("***http is:", http)
         if not http:
             if session:
                 session._close_socket(self.socket)
             else:
                 self.socket.close()
-            raise RuntimeError("Unable to read HTTP response.")
+            raise ContentDecodingError("Unable to read HTTP response.")
         self.status_code = int(bytes(self._readto(b" ")))
         self.reason = self._readto(b"\r\n")
         self._parse_headers()
@@ -190,7 +203,7 @@ class Response:
 
     def _readinto(self, buf: bytearray) -> int:
         if not self.socket:
-            raise RuntimeError(
+            raise RequestException(
                 "Newer Response closed this one. Use Responses immediately."
             )
 
@@ -200,7 +213,7 @@ class Response:
                 # Consume trailing \r\n for chunks 2+
                 if self._remaining == 0:
                     self._throw_away(2)
-                chunk_header = bytes(self._readto(b"\r\n")).split(b";")[0]
+                chunk_header = bytes(self._readto(b"\r\n")).split(b";", 1)[0]
                 http_chunk_size = int(bytes(chunk_header), 16)
                 if http_chunk_size == 0:
                     self._chunked = False
@@ -241,7 +254,7 @@ class Response:
                 self._throw_away(self._remaining)
             elif self._chunked:
                 while True:
-                    chunk_header = bytes(self._readto(b"\r\n")).split(b";")[0]
+                    chunk_header = bytes(self._readto(b"\r\n")).split(b";", 1)[0]
                     chunk_size = int(bytes(chunk_header), 16)
                     if chunk_size == 0:
                         break
@@ -273,6 +286,17 @@ class Response:
                     self._chunked = content.strip().lower() == "chunked"
                 self._headers[title] = content
 
+    def _validate_not_gzip(self) -> None:
+        """gzip encoding is not supported. Raise an exception if found."""
+        if (
+            "content-encoding" in self.headers
+            and self.headers["content-encoding"] == "gzip"
+        ):
+            raise ContentDecodingError(
+                "Content-encoding is gzip, data cannot be accessed as json or text. "
+                "Use content property to access raw bytes."
+            )
+
     @property
     def headers(self) -> Dict[str, str]:
         """
@@ -287,7 +311,7 @@ class Response:
         if self._cached is not None:
             if isinstance(self._cached, bytes):
                 return self._cached
-            raise RuntimeError("Cannot access content after getting text or json")
+            raise RequestException("Cannot access content after getting text or json")
 
         self._cached = b"".join(self.iter_content(chunk_size=32))
         return self._cached
@@ -299,29 +323,26 @@ class Response:
         if self._cached is not None:
             if isinstance(self._cached, str):
                 return self._cached
-            raise RuntimeError("Cannot access text after getting content or json")
+            raise RequestException("Cannot access text after getting content or json")
+
+        self._validate_not_gzip()
+
         self._cached = str(self.content, self.encoding)
         return self._cached
 
     def json(self) -> Any:
         """The HTTP content, parsed into a json dictionary"""
-        # pylint: disable=import-outside-toplevel
-        import json
-
         # The cached JSON will be a list or dictionary.
         if self._cached:
             if isinstance(self._cached, (list, dict)):
                 return self._cached
-            raise RuntimeError("Cannot access json after getting text or content")
+            raise RequestException("Cannot access json after getting text or content")
         if not self._raw:
             self._raw = _RawResponse(self)
 
-        try:
-            obj = json.load(self._raw)
-        except OSError:
-            # <5.3.1 doesn't piecemeal load json from any object with readinto so load the whole
-            # string.
-            obj = json.loads(self._raw.read())
+        self._validate_not_gzip()
+
+        obj = json_module.load(self._raw)
         if not self._cached:
             self._cached = obj
         self.close()
@@ -331,7 +352,7 @@ class Response:
         """An iterator that will stream data by only reading 'chunk_size'
         bytes and yielding them, when we can't buffer the whole datastream"""
         if decode_unicode:
-            raise NotImplementedError("Unicode not supported")
+            raise ContentDecodingError("Unicode not supported")
 
         b = bytearray(chunk_size)
         while True:
@@ -362,8 +383,7 @@ class Session:
         self._last_response = None
 
     def _free_socket(self, socket: SocketType) -> None:
-        if socket not in self._open_sockets.values():
-            raise RuntimeError("Socket not from session")
+        assert socket in self._open_sockets.values()
         self._socket_free[socket] = True
 
     def _close_socket(self, sock: SocketType) -> None:
@@ -409,7 +429,7 @@ class Session:
                 if any(self._socket_free.items()):
                     self._free_sockets()
                 else:
-                    raise RuntimeError("Sending request failed")
+                    raise RetryError("Sending request failed")
             retry_count += 1
 
             try:
@@ -435,7 +455,7 @@ class Session:
                 sock = None
 
         if sock is None:
-            raise RuntimeError("Repeated socket failures")
+            raise RetryError("Repeated socket failures")
 
         self._open_sockets[key] = sock
         self._socket_free[sock] = False
@@ -449,17 +469,18 @@ class Session:
             try:
                 sent = socket.send(data[total_sent:])
             except OSError as exc:
-                if exc.errno == EAGAIN:
+                if exc.errno == errno.EAGAIN:
                     # Can't send right now (e.g., no buffer space), try again.
                     continue
                 # Some worse error.
-                raise _SendFailed()
-            except RuntimeError:
-                sent = 0
+                raise
+            except RuntimeError as exc:
+                raise OSError(errno.EIO) from exc
             if sent is None:
                 sent = len(data)
             if sent == 0:
-                raise _SendFailed()
+                # Not EAGAIN; that was already handled.
+                raise OSError(errno.EIO)
             total_sent += sent
 
     def _send_request(
@@ -491,11 +512,6 @@ class Session:
             self._send(socket, b"\r\n")
         if json is not None:
             assert data is None
-            # pylint: disable=import-outside-toplevel
-            try:
-                import json as json_module
-            except ImportError:
-                import ujson as json_module
             data = json_module.dumps(json)
             self._send(socket, b"Content-Type: application/json\r\n")
         if data:
@@ -547,7 +563,7 @@ class Session:
         elif proto == "https:":
             port = 443
         else:
-            raise ValueError("Unsupported protocol: " + proto)
+            raise InvalidSchema("Unsupported protocol: " + proto)
 
         if ":" in host:
             host, port = host.split(":", 1)
@@ -566,7 +582,7 @@ class Session:
             ok = True
             try:
                 self._send_request(socket, host, method, path, headers, data, json)
-            except (_SendFailed, OSError):
+            except OSError:
                 ok = False
             if ok:
                 # Read the H of "HTTP/1.1" to make sure the socket is alive. send can appear to work
@@ -586,7 +602,7 @@ class Session:
             socket = None
 
         if not socket:
-            raise OutOfRetries("Repeated socket failures")
+            raise RetryError("Repeated socket failures")
 
         resp = Response(socket, self)  # our response
         if "location" in resp.headers and 300 <= resp.status_code <= 399:
