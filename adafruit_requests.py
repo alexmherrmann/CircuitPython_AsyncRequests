@@ -47,106 +47,19 @@ if sys.implementation.name == "circuitpython":
         """No-op shim for the typing.cast() function which is not available in CircuitPython."""
         return value
 
-else:
-    from ssl import SSLContext
-    from types import ModuleType, TracebackType
-    from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, Union, cast
 
-    # Based on https://github.com/python/typeshed/blob/master/stdlib/_socket.pyi
-    class CommonSocketType(Protocol):
-        """Describes the common structure every socket type must have."""
-
-        def send(self, data: bytes, flags: int = ...) -> None:
-            """Send data to the socket. The meaning of the optional flags kwarg is
-            implementation-specific."""
-            ...
-
-        def settimeout(self, value: Optional[float]) -> None:
-            """Set a timeout on blocking socket operations."""
-            ...
-
-        def close(self) -> None:
-            """Close the socket."""
-            ...
-
-    class CommonCircuitPythonSocketType(CommonSocketType, Protocol):
-        """Describes the common structure every CircuitPython socket type must have."""
-
-        def connect(
-            self,
-            address: Tuple[str, int],
-            conntype: Optional[int] = ...,
-        ) -> None:
-            """Connect to a remote socket at the provided (host, port) address. The conntype
-            kwarg optionally may indicate SSL or not, depending on the underlying interface."""
-            ...
-
-    class LegacyCircuitPythonSocketType(CommonCircuitPythonSocketType, Protocol):
-        """Describes the structure a legacy CircuitPython socket type must have."""
-
-        def recv(self, bufsize: int = ...) -> bytes:
-            """Receive data from the socket. The return value is a bytes object representing
-            the data received. The maximum amount of data to be received at once is specified
-            by bufsize."""
-            ...
-
-    class SupportsRecvWithFlags(Protocol):
-        """Describes a type that posseses a socket recv() method supporting the flags kwarg."""
-
-        def recv(self, bufsize: int = ..., flags: int = ...) -> bytes:
-            """Receive data from the socket. The return value is a bytes object representing
-            the data received. The maximum amount of data to be received at once is specified
-            by bufsize. The meaning of the optional flags kwarg is implementation-specific."""
-            ...
-
-    class SupportsRecvInto(Protocol):
-        """Describes a type that possesses a socket recv_into() method."""
-
-        def recv_into(
-            self, buffer: bytearray, nbytes: int = ..., flags: int = ...
-        ) -> int:
-            """Receive up to nbytes bytes from the socket, storing the data into the provided
-            buffer. If nbytes is not specified (or 0), receive up to the size available in the
-            given buffer. The meaning of the optional flags kwarg is implementation-specific.
-            Returns the number of bytes received."""
-            ...
-
-    class CircuitPythonSocketType(
-        CommonCircuitPythonSocketType,
-        SupportsRecvInto,
-        SupportsRecvWithFlags,
-        Protocol,
-    ):  # pylint: disable=too-many-ancestors
-        """Describes the structure every modern CircuitPython socket type must have."""
-
-        ...
-
-    class StandardPythonSocketType(
-        CommonSocketType, SupportsRecvInto, SupportsRecvWithFlags, Protocol
-    ):
-        """Describes the structure every standard Python socket type must have."""
-
-        def connect(self, address: Union[Tuple[Any, ...], str, bytes]) -> None:
-            """Connect to a remote socket at the provided address."""
-            ...
-
-    SocketType = Union[
-        LegacyCircuitPythonSocketType,
+try:
+    from types import TracebackType
+    from typing import Any, Dict, List, Optional, Tuple, Type, cast
+    from circuitpython_typing.socket import (
         CircuitPythonSocketType,
-        StandardPythonSocketType,
-    ]
-
-    SocketpoolModuleType = ModuleType
-
-    class InterfaceType(Protocol):
-        """Describes the structure every interface type must have."""
-
-        @property
-        def TLS_MODE(self) -> int:  # pylint: disable=invalid-name
-            """Constant representing that a socket's connection mode is TLS."""
-            ...
-
-    SSLContextType = Union[SSLContext, "_FakeSSLContext"]
+        SocketType,
+        SocketpoolModuleType,
+        InterfaceType,
+        SSLContextType,
+    )
+except ImportError:
+    pass
 
 
 class _RawResponse:
@@ -168,8 +81,20 @@ class _RawResponse:
         return self._response._readinto(buf)  # pylint: disable=protected-access
 
 
-class OutOfRetries(Exception):
+class RequestException(OSError):
+    """Parent class for all requests exceptions"""
+
+
+class RetryError(RequestException):
     """Raised when requests has retried to make a request unsuccessfully."""
+
+
+class ContentDecodingError(RequestException):
+    """Failed to decode response content."""
+
+
+class InvalidSchema(RequestException):
+    """The URL scheme provided is either invalid or unsupported."""
 
 
 class Response:
@@ -195,12 +120,13 @@ class Response:
         self._backwards_compatible = not hasattr(sock, "recv_into")
 
         http = self._readto(b" ")
+        print("***http is:", http)
         if not http:
             if session:
                 session._close_socket(self.socket)
             else:
                 self.socket.close()
-            raise RuntimeError("Unable to read HTTP response.")
+            raise ContentDecodingError("Unable to read HTTP response.")
         self.status_code = int(bytes(self._readto(b" ")))
         self.reason = self._readto(b"\r\n")
         self._parse_headers()
@@ -277,7 +203,7 @@ class Response:
 
     def _readinto(self, buf: bytearray) -> int:
         if not self.socket:
-            raise RuntimeError(
+            raise RequestException(
                 "Newer Response closed this one. Use Responses immediately."
             )
 
@@ -366,7 +292,7 @@ class Response:
             "content-encoding" in self.headers
             and self.headers["content-encoding"] == "gzip"
         ):
-            raise ValueError(
+            raise ContentDecodingError(
                 "Content-encoding is gzip, data cannot be accessed as json or text. "
                 "Use content property to access raw bytes."
             )
@@ -385,7 +311,7 @@ class Response:
         if self._cached is not None:
             if isinstance(self._cached, bytes):
                 return self._cached
-            raise RuntimeError("Cannot access content after getting text or json")
+            raise RequestException("Cannot access content after getting text or json")
 
         self._cached = b"".join(self.iter_content(chunk_size=32))
         return self._cached
@@ -397,7 +323,7 @@ class Response:
         if self._cached is not None:
             if isinstance(self._cached, str):
                 return self._cached
-            raise RuntimeError("Cannot access text after getting content or json")
+            raise RequestException("Cannot access text after getting content or json")
 
         self._validate_not_gzip()
 
@@ -410,7 +336,7 @@ class Response:
         if self._cached:
             if isinstance(self._cached, (list, dict)):
                 return self._cached
-            raise RuntimeError("Cannot access json after getting text or content")
+            raise RequestException("Cannot access json after getting text or content")
         if not self._raw:
             self._raw = _RawResponse(self)
 
@@ -426,7 +352,7 @@ class Response:
         """An iterator that will stream data by only reading 'chunk_size'
         bytes and yielding them, when we can't buffer the whole datastream"""
         if decode_unicode:
-            raise NotImplementedError("Unicode not supported")
+            raise ContentDecodingError("Unicode not supported")
 
         b = bytearray(chunk_size)
         while True:
@@ -457,8 +383,7 @@ class Session:
         self._last_response = None
 
     def _free_socket(self, socket: SocketType) -> None:
-        if socket not in self._open_sockets.values():
-            raise RuntimeError("Socket not from session")
+        assert socket in self._open_sockets.values()
         self._socket_free[socket] = True
 
     def _close_socket(self, sock: SocketType) -> None:
@@ -504,7 +429,7 @@ class Session:
                 if any(self._socket_free.items()):
                     self._free_sockets()
                 else:
-                    raise RuntimeError("Sending request failed")
+                    raise RetryError("Sending request failed")
             retry_count += 1
 
             try:
@@ -530,7 +455,7 @@ class Session:
                 sock = None
 
         if sock is None:
-            raise RuntimeError("Repeated socket failures")
+            raise RetryError("Repeated socket failures")
 
         self._open_sockets[key] = sock
         self._socket_free[sock] = False
@@ -638,7 +563,7 @@ class Session:
         elif proto == "https:":
             port = 443
         else:
-            raise ValueError("Unsupported protocol: " + proto)
+            raise InvalidSchema("Unsupported protocol: " + proto)
 
         if ":" in host:
             host, port = host.split(":", 1)
@@ -677,7 +602,7 @@ class Session:
             socket = None
 
         if not socket:
-            raise OutOfRetries("Repeated socket failures")
+            raise RetryError("Repeated socket failures")
 
         resp = Response(socket, self)  # our response
         if "location" in resp.headers and 300 <= resp.status_code <= 399:
