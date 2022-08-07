@@ -25,6 +25,10 @@
 # CircuitPython-specific files
 *.mpy
 
+# Tox files
+/.tox
+/.eggs
+
 # Python-specific files
 __pycache__
 *.pyc
