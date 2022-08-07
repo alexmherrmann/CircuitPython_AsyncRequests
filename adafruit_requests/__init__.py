@@ -47,19 +47,27 @@ if sys.implementation.name == "circuitpython":
         """No-op shim for the typing.cast() function which is not available in CircuitPython."""
         return value
 
+else:
+    from ssl import SSLContext
+    from types import ModuleType, TracebackType
+    from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
-try:
-    from types import TracebackType
-    from typing import Any, Dict, List, Optional, Tuple, Type, cast
-    from circuitpython_typing.socket import (
-        CircuitPythonSocketType,
-        SocketType,
-        SocketpoolModuleType,
-        InterfaceType,
-        SSLContextType,
-    )
-except ImportError:
-    pass
+    try:
+        from typing import Protocol
+    except ImportError:
+        from typing_extensions import Protocol
+
+    SocketpoolModuleType = ModuleType
+
+    class InterfaceType(Protocol):
+        """Describes the structure every interface type must have."""
+
+        @property
+        def TLS_MODE(self) -> int:  # pylint: disable=invalid-name
+            """Constant representing that a socket's connection mode is TLS."""
+            ...
+
+    SSLContextType = Union[SSLContext, "_FakeSSLContext"]
 
 
 class _RawResponse:
@@ -81,11 +89,7 @@ class _RawResponse:
         return self._response._readinto(buf)  # pylint: disable=protected-access
 
 
-class RequestException(OSError):
-    """Parent class for all requests exceptions"""
-
-
-class RetryError(RequestException):
+class OutOfRetries(Exception):
     """Raised when requests has retried to make a request unsuccessfully."""
 
 
@@ -238,11 +242,14 @@ class Response:
         nbytes -= self._read_from_buffer(nbytes=nbytes)
 
         buf = self._receive_buffer
-        for _ in range(nbytes // len(buf)):
-            self._recv_into(buf)
-        remaining = nbytes % len(buf)
-        if remaining:
-            self._recv_into(buf, remaining)
+        len_buf = len(buf)
+        for _ in range(nbytes // len_buf):
+            to_read = len_buf
+            while to_read > 0:
+                to_read -= self._recv_into(buf, to_read)
+        to_read = nbytes % len_buf
+        while to_read > 0:
+            to_read -= self._recv_into(buf, to_read)
 
     def close(self) -> None:
         """Drain the remaining ESP socket buffers. We assume we already got what we wanted."""
@@ -284,7 +291,10 @@ class Response:
                     self._remaining = int(content)
                 if title == "transfer-encoding":
                     self._chunked = content.strip().lower() == "chunked"
-                self._headers[title] = content
+                if title == "set-cookie" and title in self._headers:
+                    self._headers[title] += ", " + content
+                else:
+                    self._headers[title] = content
 
     def _validate_not_gzip(self) -> None:
         """gzip encoding is not supported. Raise an exception if found."""
@@ -292,7 +302,7 @@ class Response:
             "content-encoding" in self.headers
             and self.headers["content-encoding"] == "gzip"
         ):
-            raise ContentDecodingError(
+            raise ValueError(
                 "Content-encoding is gzip, data cannot be accessed as json or text. "
                 "Use content property to access raw bytes."
             )
@@ -326,7 +336,6 @@ class Response:
             raise RequestException("Cannot access text after getting content or json")
 
         self._validate_not_gzip()
-
         self._cached = str(self.content, self.encoding)
         return self._cached
 
@@ -523,13 +532,12 @@ class Session:
                 for k in data:
                     _post_data = "{}&{}={}".format(_post_data, k, data[k])
                 data = _post_data[1:]
+            if isinstance(data, str):
+                data = bytes(data, "utf-8")
             self._send(socket, b"Content-Length: %d\r\n" % len(data))
         self._send(socket, b"\r\n")
         if data:
-            if isinstance(data, bytearray):
-                self._send(socket, bytes(data))
-            else:
-                self._send(socket, bytes(data, "utf-8"))
+            self._send(socket, bytes(data))
 
     # pylint: disable=too-many-branches, too-many-statements, unused-argument, too-many-arguments, too-many-locals
     def request(
