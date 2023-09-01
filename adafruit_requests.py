@@ -50,7 +50,7 @@ if sys.implementation.name == "circuitpython":
 else:
     from ssl import SSLContext
     from types import ModuleType, TracebackType
-    from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
+    from typing import Any, Dict, Optional, Tuple, Type, Union, cast
 
     try:
         from typing import Protocol
@@ -64,15 +64,12 @@ else:
         def send(self, data: bytes, flags: int = ...) -> None:
             """Send data to the socket. The meaning of the optional flags kwarg is
             implementation-specific."""
-            ...
 
         def settimeout(self, value: Optional[float]) -> None:
             """Set a timeout on blocking socket operations."""
-            ...
 
         def close(self) -> None:
             """Close the socket."""
-            ...
 
     class CommonCircuitPythonSocketType(CommonSocketType, Protocol):
         """Describes the common structure every CircuitPython socket type must have."""
@@ -84,7 +81,6 @@ else:
         ) -> None:
             """Connect to a remote socket at the provided (host, port) address. The conntype
             kwarg optionally may indicate SSL or not, depending on the underlying interface."""
-            ...
 
     class LegacyCircuitPythonSocketType(CommonCircuitPythonSocketType, Protocol):
         """Describes the structure a legacy CircuitPython socket type must have."""
@@ -93,7 +89,6 @@ else:
             """Receive data from the socket. The return value is a bytes object representing
             the data received. The maximum amount of data to be received at once is specified
             by bufsize."""
-            ...
 
     class SupportsRecvWithFlags(Protocol):
         """Describes a type that posseses a socket recv() method supporting the flags kwarg."""
@@ -102,7 +97,6 @@ else:
             """Receive data from the socket. The return value is a bytes object representing
             the data received. The maximum amount of data to be received at once is specified
             by bufsize. The meaning of the optional flags kwarg is implementation-specific."""
-            ...
 
     class SupportsRecvInto(Protocol):
         """Describes a type that possesses a socket recv_into() method."""
@@ -114,7 +108,6 @@ else:
             buffer. If nbytes is not specified (or 0), receive up to the size available in the
             given buffer. The meaning of the optional flags kwarg is implementation-specific.
             Returns the number of bytes received."""
-            ...
 
     class CircuitPythonSocketType(
         CommonCircuitPythonSocketType,
@@ -124,8 +117,6 @@ else:
     ):  # pylint: disable=too-many-ancestors
         """Describes the structure every modern CircuitPython socket type must have."""
 
-        ...
-
     class StandardPythonSocketType(
         CommonSocketType, SupportsRecvInto, SupportsRecvWithFlags, Protocol
     ):
@@ -133,7 +124,6 @@ else:
 
         def connect(self, address: Union[Tuple[Any, ...], str, bytes]) -> None:
             """Connect to a remote socket at the provided address."""
-            ...
 
     SocketType = Union[
         LegacyCircuitPythonSocketType,
@@ -149,7 +139,6 @@ else:
         @property
         def TLS_MODE(self) -> int:  # pylint: disable=invalid-name
             """Constant representing that a socket's connection mode is TLS."""
-            ...
 
     SSLContextType = Union[SSLContext, "_FakeSSLContext"]
 
@@ -510,19 +499,22 @@ class Session:
         )[0]
         retry_count = 0
         sock = None
+        last_exc = None
         while retry_count < 5 and sock is None:
             if retry_count > 0:
                 if any(self._socket_free.items()):
                     self._free_sockets()
                 else:
-                    raise RuntimeError("Sending request failed")
+                    raise RuntimeError("Sending request failed") from last_exc
             retry_count += 1
 
             try:
                 sock = self._socket_pool.socket(addr_info[0], addr_info[1])
-            except OSError:
+            except OSError as exc:
+                last_exc = exc
                 continue
-            except RuntimeError:
+            except RuntimeError as exc:
+                last_exc = exc
                 continue
 
             connect_host = addr_info[-1][0]
@@ -533,15 +525,17 @@ class Session:
 
             try:
                 sock.connect((connect_host, port))
-            except MemoryError:
+            except MemoryError as exc:
+                last_exc = exc
                 sock.close()
                 sock = None
-            except OSError:
+            except OSError as exc:
+                last_exc = exc
                 sock.close()
                 sock = None
 
         if sock is None:
-            raise RuntimeError("Repeated socket failures")
+            raise RuntimeError("Repeated socket failures") from last_exc
 
         self._open_sockets[key] = sock
         self._socket_free[sock] = False
@@ -575,7 +569,7 @@ class Session:
         host: str,
         method: str,
         path: str,
-        headers: List[Dict[str, str]],
+        headers: Dict[str, str],
         data: Any,
         json: Any,
     ):
@@ -623,7 +617,7 @@ class Session:
         url: str,
         data: Optional[Any] = None,
         json: Optional[Any] = None,
-        headers: Optional[List[Dict[str, str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
         stream: bool = False,
         timeout: float = 60,
     ) -> Response:
@@ -661,13 +655,15 @@ class Session:
         # We may fail to send the request if the socket we got is closed already. So, try a second
         # time in that case.
         retry_count = 0
+        last_exc = None
         while retry_count < 2:
             retry_count += 1
             socket = self._get_socket(host, port, proto, timeout=timeout)
             ok = True
             try:
                 self._send_request(socket, host, method, path, headers, data, json)
-            except OSError:
+            except OSError as exc:
+                last_exc = exc
                 ok = False
             if ok:
                 # Read the H of "HTTP/1.1" to make sure the socket is alive. send can appear to work
@@ -687,7 +683,7 @@ class Session:
             socket = None
 
         if not socket:
-            raise OutOfRetries("Repeated socket failures")
+            raise OutOfRetries("Repeated socket failures") from last_exc
 
         resp = Response(socket, self)  # our response
         if "location" in resp.headers and 300 <= resp.status_code <= 399:
@@ -793,7 +789,7 @@ def request(
     url: str,
     data: Optional[Any] = None,
     json: Optional[Any] = None,
-    headers: Optional[List[Dict[str, str]]] = None,
+    headers: Optional[Dict[str, str]] = None,
     stream: bool = False,
     timeout: float = 1,
 ) -> None:
